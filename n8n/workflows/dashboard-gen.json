@@ -1,0 +1,380 @@
+{
+  "name": "AI Dashboard Generator — Agent Edition",
+  "nodes": [
+
+    {
+      "id": "node-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [100, 300],
+      "parameters": {
+        "path": "dashboard-gen",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "node-normalize",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [340, 300],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "name": "dashboard_id",        "value": "={{ $json.dashboard_id }}",        "type": "string" },
+            { "name": "domain",              "value": "={{ $json.domain }}",              "type": "string" },
+            { "name": "business_goal",       "value": "={{ $json.business_goal }}",       "type": "string" },
+            { "name": "dataset_description", "value": "={{ $json.dataset_description }}", "type": "string" },
+            { "name": "dataset_context",     "value": "={{ $json.dataset_context }}",     "type": "string" },
+            { "name": "columns",             "value": "={{ $json.columns }}",             "type": "array"  },
+            { "name": "row_count",           "value": "={{ $json.row_count }}",           "type": "number" },
+            { "name": "theme",               "value": "={{ $json.theme || 'modern' }}",   "type": "string" }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "node-agent-1",
+      "name": "Agent 1 — Input Understanding",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [600, 300],
+      "parameters": {
+        "agentType": "conversationalAgent",
+        "text": "=You must return ONLY a valid JSON object — no markdown, no explanation.\n\nDomain: {{ $json.domain }}\nRow count: {{ $json.row_count }}\nColumns available: {{ JSON.stringify($json.columns) }}\nDataset context: {{ $json.dataset_context }}\n\nClassify every column into exactly one category:\n- dimensions: categorical / text / ID columns\n- measures: numeric columns suitable for aggregation\n- time_fields: date, datetime, timestamp columns\n\nAlso produce:\n- analytical_richness_score (integer 0-100)\n- warnings (array of data quality strings)\n\nReturn this exact JSON shape and nothing else:\n{\n  \"dimensions\": [],\n  \"measures\": [],\n  \"time_fields\": [],\n  \"analytical_richness_score\": 0,\n  \"warnings\": []\n}",
+        "options": {
+          "systemMessage": "You are a senior dataset analyst. Your only job is to classify dataset columns and assess analytical richness. You NEVER invent columns that do not exist in the provided list. You return ONLY raw JSON — no markdown fences, no prose, no explanation. If a column is ambiguous, classify it by its most likely use based on the domain context."
+        }
+      }
+    },
+
+    {
+      "id": "node-llm-1",
+      "name": "Anthropic Model — Agent 1",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [600, 520],
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 1200
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic API"
+        }
+      }
+    },
+
+    {
+      "id": "node-parse-1",
+      "name": "Parse — Agent 1 Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300],
+      "parameters": {
+        "jsCode": "// Agent 1 output arrives in $json.output as a string\nconst raw = $input.first().json.output || '';\nlet parsed = {};\ntry {\n  // Strip accidental markdown fences if the model adds them\n  const cleaned = raw.replace(/```json?\\n?/gi, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = {\n    dimensions: [],\n    measures: [],\n    time_fields: [],\n    analytical_richness_score: 50,\n    warnings: ['Agent 1 parse error: ' + e.message]\n  };\n}\n\nconst prev = $('Normalize Input').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    dataset_meta: {\n      dimensions:                parsed.dimensions                || [],\n      measures:                  parsed.measures                  || [],\n      time_fields:               parsed.time_fields               || [],\n      analytical_richness_score: parsed.analytical_richness_score || 50,\n      warnings:                  parsed.warnings                  || [],\n      row_count:                 prev.row_count\n    }\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "node-agent-2",
+      "name": "Agent 2 — Insight Generator",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1120, 300],
+      "parameters": {
+        "agentType": "conversationalAgent",
+        "text": "=You must return ONLY a valid JSON object — no markdown, no explanation.\n\nDomain: {{ $json.domain }}\nBusiness Goal: {{ $json.business_goal }}\nDimensions: {{ JSON.stringify($json.dataset_meta.dimensions) }}\nMeasures: {{ JSON.stringify($json.dataset_meta.measures) }}\nTime fields: {{ JSON.stringify($json.dataset_meta.time_fields) }}\nDataset context: {{ $json.dataset_context }}\n\nGenerate KPIs and business insights. ALL field references must come from the dimensions/measures/time_fields lists above.\n\nKPI schema (max 8, no duplicate titles):\n{\n  \"kpi_id\": \"kpi_001\",\n  \"title\": \"Total Revenue\",\n  \"field\": \"revenue\",\n  \"aggregation\": \"sum\",\n  \"format\": \"currency\",\n  \"prefix\": \"$\",\n  \"suffix\": \"\",\n  \"business_meaning\": \"Total revenue in selected period\",\n  \"target_audiences\": [\"top_management\", \"c_suite\"]\n}\naggregation options: sum | avg | count | count_distinct | min | max | median\nformat options: number | currency | percentage | duration\ntarget_audiences options: end_users | middle_management | top_management | c_suite\n\nInsight schema (max 16, no duplicate titles):\n{\n  \"insight_id\": \"ins_001\",\n  \"title\": \"Revenue Concentration by Region\",\n  \"business_meaning\": \"Top 3 regions drive 72% of revenue\",\n  \"required_fields\": [\"revenue\", \"region\"],\n  \"calculation_logic\": \"Group by region, rank descending, compute top-3 share\",\n  \"confidence_score\": 0.9,\n  \"target_audience\": \"top_management\",\n  \"business_impact_score\": 9\n}\nbusiness_impact_score: 1-10 integer\n\nReturn this exact JSON shape:\n{\n  \"kpis\": [...],\n  \"insights\": [...]\n}",
+        "options": {
+          "systemMessage": "You are a senior BI analyst and business intelligence expert. You generate ONLY insights and KPIs that are directly derivable from the columns provided. You NEVER fabricate column names, relationships, or metrics that cannot be computed from the available data. You prioritize high business_impact_score insights. You return ONLY raw JSON — no markdown, no explanation."
+        }
+      }
+    },
+
+    {
+      "id": "node-llm-2",
+      "name": "Anthropic Model — Agent 2",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [1120, 520],
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 3000
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic API"
+        }
+      }
+    },
+
+    {
+      "id": "node-parse-2",
+      "name": "Parse — Agent 2 Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.output || '';\nlet parsed = {};\ntry {\n  const cleaned = raw.replace(/```json?\\n?/gi, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = { kpis: [], insights: [] };\n}\n\nconst prev = $('Parse — Agent 1 Output').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    kpis:     parsed.kpis     || [],\n    insights: parsed.insights || []\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "node-agent-3",
+      "name": "Agent 3 — Visualization Planner",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1640, 300],
+      "parameters": {
+        "agentType": "conversationalAgent",
+        "text": "=You must return ONLY a valid JSON object — no markdown, no explanation.\n\nDomain: {{ $json.domain }}\nDimensions: {{ JSON.stringify($json.dataset_meta.dimensions) }}\nMeasures: {{ JSON.stringify($json.dataset_meta.measures) }}\nTime fields: {{ JSON.stringify($json.dataset_meta.time_fields) }}\nTop insights: {{ JSON.stringify($json.insights.slice(0, 12)) }}\n\nMap each insight to the best chart. ALL field values in chart.fields must exist in dimensions/measures/time_fields.\n\nChart schema (max 20 charts, no duplicate titles):\n{\n  \"chart_id\": \"chart_001\",\n  \"title\": \"Revenue Trend by Month\",\n  \"type\": \"line\",\n  \"fields\": {\n    \"x\": \"order_date\",\n    \"y\": \"revenue\",\n    \"y2\": \"profit_margin\",\n    \"series\": \"product_category\",\n    \"value\": \"revenue\",\n    \"label\": \"region\"\n  },\n  \"aggregation\": \"sum\",\n  \"sort\": { \"field\": \"revenue\", \"direction\": \"desc\" },\n  \"top_n\": 10,\n  \"insight_text\": \"Revenue grew 23% YoY in Q3\",\n  \"priority_score\": 9,\n  \"mobile_friendly\": true,\n  \"recommended_size\": \"large\",\n  \"target_audiences\": [\"top_management\", \"c_suite\"]\n}\n\nAllowed chart types:\nline | area | bar | bar_horizontal | stacked_bar | scatter |\npie | donut | heatmap | treemap | funnel | gauge | histogram | box_plot | table\n\nVisualization rules:\n- time series -> line or area (NEVER bar for time trends)\n- rankings / top N -> bar_horizontal\n- part-of-whole contributions -> stacked_bar or treemap\n- pie / donut ONLY if distinct category count <= 5\n- correlation between 2 measures -> scatter\n- KPI target achievement -> gauge\n- value distributions -> histogram or box_plot\n- funnel / pipeline stages -> funnel\n- cross-dimensional patterns -> heatmap\n\nFilter schema (create 2-4 global filters):\n{\n  \"filter_id\": \"f_001\",\n  \"label\": \"Date Range\",\n  \"field\": \"order_date\",\n  \"type\": \"date_range\"\n}\nFilter type options: date_range | select | multi_select | number_range\n\nReturn this exact JSON shape:\n{\n  \"charts\": [...],\n  \"global_filters\": [...]\n}",
+        "options": {
+          "systemMessage": "You are a senior data visualization architect. You apply evidence-based visualization best practices: the right chart for each data shape, never overloading a dashboard, never using pie charts with many slices. You NEVER reference columns that do not exist in the dataset. You return ONLY raw JSON — no markdown, no explanation."
+        }
+      }
+    },
+
+    {
+      "id": "node-llm-3",
+      "name": "Anthropic Model — Agent 3",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [1640, 520],
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 3500
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic API"
+        }
+      }
+    },
+
+    {
+      "id": "node-parse-3",
+      "name": "Parse — Agent 3 Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.output || '';\nlet parsed = {};\ntry {\n  const cleaned = raw.replace(/```json?\\n?/gi, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = { charts: [], global_filters: [] };\n}\n\nconst prev = $('Parse — Agent 2 Output').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    charts:         parsed.charts         || [],\n    global_filters: parsed.global_filters || []\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "node-agent-4",
+      "name": "Agent 4 — Audience Mapper",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [2160, 300],
+      "parameters": {
+        "agentType": "conversationalAgent",
+        "text": "=You must return ONLY a valid JSON object — no markdown, no explanation.\n\nDomain: {{ $json.domain }}\nBusiness Goal: {{ $json.business_goal }}\n\nAvailable KPIs:\n{{ JSON.stringify($json.kpis.map(k => ({ kpi_id: k.kpi_id, title: k.title, format: k.format, target_audiences: k.target_audiences }))) }}\n\nAvailable Charts:\n{{ JSON.stringify($json.charts.map(c => ({ chart_id: c.chart_id, title: c.title, type: c.type, priority_score: c.priority_score, target_audiences: c.target_audiences }))) }}\n\nAssign KPIs and charts to 4 audience tabs.\n\nTab schema:\n{\n  \"label\": \"C-Suite / Leaders\",\n  \"description\": \"Strategic performance overview for executive decisions\",\n  \"kpi_ids\": [...],\n  \"chart_ids\": [...]\n}\n\nHard limits (do NOT exceed):\n- c_suite:           max 6 KPIs, max 6 charts\n- top_management:    max 6 KPIs, max 8 charts\n- middle_management: max 6 KPIs, max 10 charts\n- end_users:         max 6 KPIs, max 12 charts\n\nContent strategy:\n- c_suite:           strategic only — growth, profitability, forecasting, high-level anomalies\n- top_management:    summarized KPIs, department/region overview, rankings\n- middle_management: trends, team comparisons, target vs actual, performance tracking\n- end_users:         operational, granular, transaction-level, filter-heavy, tables\n\nRules:\n- A chart or KPI may appear in multiple tabs if audience-appropriate\n- ONLY use kpi_ids and chart_ids from the provided lists above — never invent IDs\n- c_suite MUST include at least one revenue/growth KPI, one trend chart, one comparison chart\n- end_users SHOULD include at least one table or granular bar chart\n\nReturn this exact JSON shape:\n{\n  \"tabs\": {\n    \"c_suite\":           { \"label\": \"C-Suite / Leaders\",    \"description\": \"...\", \"kpi_ids\": [...], \"chart_ids\": [...] },\n    \"top_management\":    { \"label\": \"Top Management\",       \"description\": \"...\", \"kpi_ids\": [...], \"chart_ids\": [...] },\n    \"middle_management\": { \"label\": \"Middle Management\",    \"description\": \"...\", \"kpi_ids\": [...], \"chart_ids\": [...] },\n    \"end_users\":         { \"label\": \"End Users\",            \"description\": \"...\", \"kpi_ids\": [...], \"chart_ids\": [...] }\n  }\n}",
+        "options": {
+          "systemMessage": "You are a BI audience strategist and information architect. You understand what each audience tier needs: executives want strategy, managers want trends and comparisons, end users want operational detail. You ONLY use the kpi_ids and chart_ids provided — you never fabricate IDs. You return ONLY raw JSON — no markdown, no explanation."
+        }
+      }
+    },
+
+    {
+      "id": "node-llm-4",
+      "name": "Anthropic Model — Agent 4",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [2160, 520],
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 2500
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic API"
+        }
+      }
+    },
+
+    {
+      "id": "node-parse-4",
+      "name": "Parse — Agent 4 Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.output || '';\nlet parsed = {};\ntry {\n  const cleaned = raw.replace(/```json?\\n?/gi, '').replace(/```/g, '').trim();\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = { tabs: {} };\n}\n\nconst prev = $('Parse — Agent 3 Output').first().json;\n\nconst defaultTab = (label) => ({\n  label,\n  description: '',\n  kpi_ids: [],\n  chart_ids: [],\n  layout: []\n});\n\nconst tabs = parsed.tabs || {};\n\nreturn [{\n  json: {\n    ...prev,\n    tabs: {\n      c_suite:           tabs.c_suite           || defaultTab('C-Suite / Leaders'),\n      top_management:    tabs.top_management    || defaultTab('Top Management'),\n      middle_management: tabs.middle_management || defaultTab('Middle Management'),\n      end_users:         tabs.end_users         || defaultTab('End Users')\n    }\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "node-agent-5",
+      "name": "Agent 5 — Layout Engine",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [2680, 300],
+      "parameters": {
+        "agentType": "conversationalAgent",
+        "text": "=You must return ONLY a valid JSON object — no markdown, no explanation.\n\nTabs and their assigned items:\n{{ JSON.stringify($json.tabs) }}\n\nChart size hints:\n{{ JSON.stringify($json.charts.map(c => ({ chart_id: c.chart_id, recommended_size: c.recommended_size, priority_score: c.priority_score, type: c.type }))) }}\n\nGenerate a 12-column responsive grid layout for each tab.\n\nLayout item schema:\n{\n  \"id\": \"kpi_001\",   // must match a kpi_id or chart_id in that tab\n  \"type\": \"kpi\",     // kpi | chart\n  \"col_span\": 3,     // integer 1-12\n  \"row_span\": 1,     // integer 1-4\n  \"order\": 1         // render order (1 = top-left first)\n}\n\nLayout rules:\n1. KPI cards always come first (lowest order numbers)\n2. KPI: col_span = 3, row_span = 1  (4 cards per 12-col row)\n3. full chart:   col_span = 12, row_span = 2\n4. large chart:  col_span = 8,  row_span = 2\n5. medium chart: col_span = 6,  row_span = 2\n6. small chart:  col_span = 4,  row_span = 1\n7. Charts with priority_score >= 8 get lower order numbers (appear first)\n8. C-Suite: fewer, larger charts (prefer large/full sizes)\n9. End Users: denser, more small/medium charts\n10. Every id in kpi_ids and chart_ids for that tab MUST appear exactly once in the layout\n\nReturn this exact JSON shape:\n{\n  \"layouts\": {\n    \"c_suite\":           [...],\n    \"top_management\":    [...],\n    \"middle_management\": [...],\n    \"end_users\":         [...]\n  }\n}",
+        "options": {
+          "systemMessage": "You are a professional dashboard UX designer specialising in enterprise BI layout. You create balanced, readable grid layouts that guide the eye from most important to least important information. You follow the 12-column grid system precisely. You ensure every assigned item appears exactly once in its tab layout. You return ONLY raw JSON — no markdown, no explanation."
+        }
+      }
+    },
+
+    {
+      "id": "node-llm-5",
+      "name": "Anthropic Model — Agent 5",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [2680, 520],
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "options": {
+          "temperature": 0,
+          "maxTokens": 2500
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic API"
+        }
+      }
+    },
+
+    {
+      "id": "node-assemble",
+      "name": "Assemble Final Spec",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2940, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.output || '';\nlet layoutData = { layouts: {} };\ntry {\n  const cleaned = raw.replace(/```json?\\n?/gi, '').replace(/```/g, '').trim();\n  layoutData = JSON.parse(cleaned);\n} catch (e) {\n  // Layout parse failed — fall back to auto-layout below\n}\n\nconst prev = $('Parse — Agent 4 Output').first().json;\nconst layouts = layoutData.layouts || {};\n\n// Merge AI layouts into tabs (or auto-generate fallback layout)\nconst tabs = {};\nfor (const tabKey of ['c_suite', 'top_management', 'middle_management', 'end_users']) {\n  const tab = prev.tabs[tabKey] || { label: tabKey, description: '', kpi_ids: [], chart_ids: [] };\n\n  if (layouts[tabKey] && layouts[tabKey].length > 0) {\n    tab.layout = layouts[tabKey];\n  } else {\n    // Auto-generate simple layout\n    const kpiItems = (tab.kpi_ids || []).map((id, i) => ({\n      id, type: 'kpi', col_span: 3, row_span: 1, order: i + 1\n    }));\n    const chartItems = (tab.chart_ids || []).map((id, i) => ({\n      id, type: 'chart', col_span: 6, row_span: 2, order: kpiItems.length + i + 1\n    }));\n    tab.layout = [...kpiItems, ...chartItems];\n  }\n\n  tabs[tabKey] = tab;\n}\n\n// Assemble the complete dashboard spec\nconst dashboardSpec = {\n  dashboard_id:  prev.dashboard_id,\n  created_at:    new Date().toISOString(),\n  domain:        prev.domain,\n  business_goal: prev.business_goal,\n  theme:         prev.theme || 'modern',\n  dataset_meta:  prev.dataset_meta,\n  global_filters: prev.global_filters || [],\n  kpis:           prev.kpis     || [],\n  charts:         prev.charts   || [],\n  insights:       prev.insights || [],\n  tabs,\n  validation: {\n    quality_score:           0,\n    duplicates_removed:      0,\n    hallucinations_detected: 0,\n    invalid_charts_removed:  0,\n    warnings:                []\n  }\n};\n\nreturn [{ json: { dashboard_spec: dashboardSpec } }];"
+      }
+    },
+
+    {
+      "id": "node-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3200, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" }
+            ]
+          }
+        }
+      }
+    }
+
+  ],
+
+  "connections": {
+
+    "Webhook Trigger": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+
+    "Normalize Input": {
+      "main": [[{ "node": "Agent 1 — Input Understanding", "type": "main", "index": 0 }]]
+    },
+
+    "Anthropic Model — Agent 1": {
+      "ai_languageModel": [[{ "node": "Agent 1 — Input Understanding", "type": "ai_languageModel", "index": 0 }]]
+    },
+
+    "Agent 1 — Input Understanding": {
+      "main": [[{ "node": "Parse — Agent 1 Output", "type": "main", "index": 0 }]]
+    },
+
+    "Parse — Agent 1 Output": {
+      "main": [[{ "node": "Agent 2 — Insight Generator", "type": "main", "index": 0 }]]
+    },
+
+    "Anthropic Model — Agent 2": {
+      "ai_languageModel": [[{ "node": "Agent 2 — Insight Generator", "type": "ai_languageModel", "index": 0 }]]
+    },
+
+    "Agent 2 — Insight Generator": {
+      "main": [[{ "node": "Parse — Agent 2 Output", "type": "main", "index": 0 }]]
+    },
+
+    "Parse — Agent 2 Output": {
+      "main": [[{ "node": "Agent 3 — Visualization Planner", "type": "main", "index": 0 }]]
+    },
+
+    "Anthropic Model — Agent 3": {
+      "ai_languageModel": [[{ "node": "Agent 3 — Visualization Planner", "type": "ai_languageModel", "index": 0 }]]
+    },
+
+    "Agent 3 — Visualization Planner": {
+      "main": [[{ "node": "Parse — Agent 3 Output", "type": "main", "index": 0 }]]
+    },
+
+    "Parse — Agent 3 Output": {
+      "main": [[{ "node": "Agent 4 — Audience Mapper", "type": "main", "index": 0 }]]
+    },
+
+    "Anthropic Model — Agent 4": {
+      "ai_languageModel": [[{ "node": "Agent 4 — Audience Mapper", "type": "ai_languageModel", "index": 0 }]]
+    },
+
+    "Agent 4 — Audience Mapper": {
+      "main": [[{ "node": "Parse — Agent 4 Output", "type": "main", "index": 0 }]]
+    },
+
+    "Parse — Agent 4 Output": {
+      "main": [[{ "node": "Agent 5 — Layout Engine", "type": "main", "index": 0 }]]
+    },
+
+    "Anthropic Model — Agent 5": {
+      "ai_languageModel": [[{ "node": "Agent 5 — Layout Engine", "type": "ai_languageModel", "index": 0 }]]
+    },
+
+    "Agent 5 — Layout Engine": {
+      "main": [[{ "node": "Assemble Final Spec", "type": "main", "index": 0 }]]
+    },
+
+    "Assemble Final Spec": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    }
+
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+
+  "tags": ["ai-agent", "dashboard", "bi", "langchain"],
+
+  "_meta": {
+    "instanceId": "ai-dashboard-platform"
+  }
+}
